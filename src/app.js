@@ -5,7 +5,7 @@ import {rateLimit} from 'express-rate-limit';
 import {z,ZodError} from 'zod';
 import {pool,transaction} from './db.js';
 import {requireAuth,requireAdmin} from './auth.js';
-import {createOrder,changeOrderStatus,HttpError} from './orders.js';
+import {createOrder,changeOrderStatus,HttpError,adminCode} from './orders.js';
 export const app=express();
 app.disable('x-powered-by');
 if (process.env.RENDER === 'true') app.set('trust proxy', 1);
@@ -49,12 +49,44 @@ app.get('/api/me/orders',requireAuth,asyncRoute(async(req,res)=>{
 app.get('/api/me/orders/:id',requireAuth,asyncRoute(async(req,res)=>{
   const id=uuid.parse(req.params.id);
   const {rows:[o]}=await pool.query(`SELECT id,order_number,status,delivery_method,contact_name,contact_phone,delivery_address,
-   subtotal_bs,shipping_fee_bs,shipping_payer,created_at FROM fiore.orders WHERE id=$1 AND customer_id=$2`,[id,req.user.id]);
+   subtotal_bs,shipping_fee_bs,shipping_payer,created_at,supervisor_id FROM fiore.orders WHERE id=$1 AND customer_id=$2`,[id,req.user.id]);
   if(!o)throw new HttpError(404,'ORDER_NOT_FOUND');
   const {rows:items}=await pool.query('SELECT product_name,sku,quantity,unit_price_bs FROM fiore.order_items WHERE order_id=$1',[id]);
-  const {rows:history}=await pool.query('SELECT new_status,created_at FROM fiore.order_status_history WHERE order_id=$1 ORDER BY created_at',[id]);
-  res.json({order:o,items,history});
+  const {supervisor_id,...order}=o;
+  res.json({order:{...order,supervisor_code:adminCode(supervisor_id)},items,...await orderConversation(id)});
 }));
+const messageBody=z.object({body:z.string().trim().min(1).max(1000)}).strict();
+async function orderConversation(id){
+  const [history,messages]=await Promise.all([
+    pool.query('SELECT id,new_status,created_at,admin_code,customer_message FROM fiore.order_status_history WHERE order_id=$1 ORDER BY id',[id]),
+    pool.query('SELECT id,author,admin_code,body,created_at FROM fiore.order_messages WHERE order_id=$1 ORDER BY id',[id])
+  ]);
+  return {history:history.rows,messages:messages.rows};
+}
+async function sendOrderMessage(req,res,asAdmin){
+  const id=uuid.parse(req.params.id);
+  const {body}=messageBody.parse(req.body);
+  const result=await transaction(async db=>{
+    const {rows:[order]}=await db.query('SELECT customer_id,supervisor_id FROM fiore.orders WHERE id=$1 FOR UPDATE',[id]);
+    if(!order||(!asAdmin&&order.customer_id!==req.user.id))throw new HttpError(404,'ORDER_NOT_FOUND');
+    if(asAdmin&&order.supervisor_id&&order.supervisor_id!==req.user.id)throw new HttpError(403,'ORDER_ASSIGNED_TO_ANOTHER_ADMIN');
+    if(asAdmin&&!order.supervisor_id)await db.query('UPDATE fiore.orders SET supervisor_id=$2 WHERE id=$1',[id,req.user.id]);
+    const {rows:[message]}=await db.query(
+      'INSERT INTO fiore.order_messages(order_id,author,admin_code,body) VALUES($1,$2,$3,$4) RETURNING id,author,admin_code,body,created_at',
+      [id,asAdmin?'admin':'customer',asAdmin?adminCode(req.user.id):null,body]);
+    return {message,supervisor_code:adminCode(order.supervisor_id??(asAdmin?req.user.id:null))};
+  });
+  res.status(201).json(result);
+}
+app.post('/api/me/orders/:id/messages',requireAuth,asyncRoute((req,res)=>sendOrderMessage(req,res,false)));
+app.get('/api/admin/orders/:id/conversation',requireAuth,requireAdmin,asyncRoute(async(req,res)=>{
+  const id=uuid.parse(req.params.id);
+  const {rows:[order]}=await pool.query('SELECT supervisor_id FROM fiore.orders WHERE id=$1',[id]);
+  if(!order)throw new HttpError(404,'ORDER_NOT_FOUND');
+  res.json({...await orderConversation(id),supervisor_code:adminCode(order.supervisor_id),
+    can_reply:!order.supervisor_id||order.supervisor_id===req.user.id});
+}));
+app.post('/api/admin/orders/:id/messages',requireAuth,requireAdmin,asyncRoute((req,res)=>sendOrderMessage(req,res,true)));
 app.get('/api/admin/inventory',requireAuth,requireAdmin,asyncRoute(async(req,res)=>{
   const {rows}=await pool.query(`SELECT p.name,v.sku,v.id AS variant_id,v.price_bs,v.is_active,
     i.physical_stock,i.safety_stock,i.committed_stock,
@@ -85,8 +117,20 @@ app.get('/api/admin/orders',requireAuth,requireAdmin,asyncRoute(async(req,res)=>
    LEFT JOIN fiore.payments p ON p.order_id=o.id ORDER BY o.created_at DESC LIMIT 100`);res.json({orders:rows});
 }));
 app.patch('/api/admin/orders/:id/status',requireAuth,requireAdmin,asyncRoute(async(req,res)=>{
-  const d=z.object({status:z.enum(['CONFIRMED','PREPARING','READY','IN_TRANSIT','DELIVERED','CANCELLED']),note:z.string().max(500).optional()}).parse(req.body);
-  res.json(await changeOrderStatus(uuid.parse(req.params.id),d.status,d.note));
+  const reasons={
+    customer_request:'Cancelado a solicitud del cliente.',
+    unavailable:'No podemos completar el pedido por falta de producto.',
+    pickup_unavailable:'No fue posible coordinar el retiro del pedido.'
+  };
+  const d=z.object({
+    status:z.enum(['CONFIRMED','PREPARING','READY','IN_TRANSIT','DELIVERED','CANCELLED']),
+    reason:z.enum(['customer_request','unavailable','pickup_unavailable','other']).optional(),
+    message:z.string().trim().min(3).max(500).optional()
+  }).parse(req.body);
+  if(d.status==='CANCELLED'&&(!d.reason||(d.reason==='other'&&!d.message)))
+    throw new HttpError(400,'CANCELLATION_REASON_REQUIRED');
+  const message=d.status==='CANCELLED'?(d.reason==='other'?d.message:reasons[d.reason]):null;
+  res.json(await changeOrderStatus(uuid.parse(req.params.id),d.status,req.user.id,message));
 }));
 app.patch('/api/admin/orders/:id/courier',requireAuth,requireAdmin,asyncRoute(async(req,res)=>{
   const d=z.object({courier_code:z.string().trim().min(2).max(30),courier_advance_bs:z.number().min(0).max(999999)}).parse(req.body);

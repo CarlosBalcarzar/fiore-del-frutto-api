@@ -67,7 +67,8 @@ export async function createOrder(user,input){
   });
 }
 const states={CONFIRMED:['PREPARING','CANCELLED'],PREPARING:['READY','CANCELLED'],READY:['IN_TRANSIT','DELIVERED','CANCELLED'],IN_TRANSIT:['DELIVERED'],DELIVERED:[],CANCELLED:[]};
-export async function changeOrderStatus(orderId,status,note=''){
+export const adminCode=id=>id ? 'FF-ADM-'+id.replaceAll('-','').slice(0,12).toUpperCase() : null;
+export async function changeOrderStatus(orderId,status,adminId,customerMessage=null){
   if(!(status in states))throw new HttpError(400,'INVALID_STATUS');
   return transaction(async db=>{
     const {rows:[order]}=await db.query('SELECT * FROM fiore.orders WHERE id=$1 FOR UPDATE',[orderId]);
@@ -86,8 +87,8 @@ export async function changeOrderStatus(orderId,status,note=''){
           VALUES($1,'ORDER_DELIVER',$2,$2,$3)`,[item.variant_id,-item.quantity,`Pedido ${order.order_number} entregado`]);
       }
     }
-    await db.query('UPDATE fiore.orders SET status=$2,updated_at=NOW() WHERE id=$1',[orderId,status]);
-    await db.query('INSERT INTO fiore.order_status_history(order_id,previous_status,new_status,note) VALUES($1,$2,$3,$4)',[orderId,order.status,status,note]);
+    await db.query('UPDATE fiore.orders SET status=$2,supervisor_id=COALESCE(supervisor_id,$3),updated_at=NOW() WHERE id=$1',[orderId,status,adminId]);
+    await db.query('INSERT INTO fiore.order_status_history(order_id,previous_status,new_status,admin_code,customer_message) VALUES($1,$2,$3,$4,$5)',[orderId,order.status,status,adminCode(adminId),customerMessage]);
     if(status==='DELIVERED')await db.query('UPDATE fiore.deliveries SET delivered_at=NOW() WHERE order_id=$1',[orderId]);
     return {id:orderId,status};
   });
